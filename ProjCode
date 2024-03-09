@@ -1,0 +1,402 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <string.h>
+#include <sys/msg.h>
+#include <omp.h>
+
+void *runner(void *param); /* the thread */
+
+//THREADs
+
+typedef struct {
+    int process_id;
+    pthread_t tid;
+    // Other process-related information
+} Process;
+
+#define MAX_PROCESSES 10
+Process processes[MAX_PROCESSES];
+int num_processes = 0;
+
+
+
+typedef struct {
+    int lwp_id;
+    int process_id;
+    // Other LWP-related information
+} LWP;
+
+#define MAX_LWPS 10
+LWP lwps[MAX_LWPS];
+int num_lwps = 0;
+
+typedef struct {
+    pthread_t tid;
+    int task_id;
+    int process_id;
+    int lwp_id;
+    int status; // 0: suspended, 1: running, 2: completed
+} ThreadInfo;
+
+#define MAX_THREADS 10
+ThreadInfo threads[MAX_THREADS];
+int num_threads = 0;
+
+void suspendThread(int task_id) {
+    for (int i = 0; i < num_threads; i++) {
+        if (threads[i].task_id == task_id) {
+            if (threads[i].status == 1) {
+                threads[i].status = 0; // Suspend thread
+                printf("Thread ID %ld suspended\n", threads[i].tid);
+                return;
+            } else {
+                printf("Thread ID %ld is already suspended\n", threads[i].tid);
+                return;
+            }
+        }
+    }
+    printf("Thread not found!\n");
+}
+
+void resumeThread(int task_id) {
+    for (int i = 0; i < num_threads; i++) {
+        if (threads[i].task_id == task_id) {
+            if (threads[i].status == 0) {
+                threads[i].status = 1; // Resume thread
+                printf("Thread ID %ld resumed\n", threads[i].tid);
+                return;
+            } else {
+                printf("Thread ID %ld is already running\n", threads[i].tid);
+                return;
+            }
+        }
+    }
+    printf("Thread not found!\n");
+}
+
+void *runner(void *param)
+{
+    ThreadInfo *thread_info = (ThreadInfo *)param;
+    int tasks_executed = 0;
+    const int max_tasks = 10;  // Maximum number of tasks to execute
+
+    while (1) {
+        // Check if the maximum number of tasks has been executed
+        if (tasks_executed >= max_tasks) {
+            // No need to print completion message
+            thread_info->status = 2; // Mark the thread as completed
+            pthread_exit(0);
+        }
+
+        // Check if thread should be suspended
+        if (thread_info->status == 0) {
+            printf("Thread %ld suspended\n", thread_info->tid);
+            while (thread_info->status == 0) {
+                // Wait until resumed
+                sleep(1);
+            }
+            printf("Thread %ld resumed\n", thread_info->tid);
+        }
+
+        tasks_executed++;
+        sleep(1); // Simulate task execution time
+    }
+}
+
+//IPC
+
+#define NUM_MESSAGES 1000
+#define MESSAGE_SIZE_SHORT 10
+#define MESSAGE_SIZE_LONG 1000
+#define MAX_MESSAGE_SIZE 100
+
+typedef struct {
+    long mtype; // Message type (must be greater than 0)
+    char mtext[MAX_MESSAGE_SIZE]; // Message content
+} Message;
+
+typedef struct {
+    int data;
+    char message[100];
+} SharedMemory;
+
+SharedMemory *shared_memory;
+
+// Message queue ID
+int msgqid;
+
+// Function to send message
+void sendMessage(const char *messageText) {
+    // Create a message instance
+    Message message;
+    message.mtype = 1; // Message type (must be greater than 0)
+    strncpy(message.mtext, messageText, MAX_MESSAGE_SIZE - 1); // Copy message content
+    message.mtext[MAX_MESSAGE_SIZE - 1] = '\0'; // Ensure null-termination
+
+    // Send the message to the message queue
+    if (msgsnd(msgqid, &message, strlen(message.mtext) + 1, 0) == -1) {
+        perror("msgsnd failed");
+        return;
+    }
+
+    printf("Message sent successfully: %s\n", message.mtext);
+}
+
+// Function to receive message
+void receiveMessage() {
+    // Create message structure
+    typedef struct {
+        long mtype;
+        char mtext[MESSAGE_SIZE_SHORT];
+    } Message;
+
+    // Define message structure
+    Message msg;
+
+    // Receive message
+    if (msgrcv(msgqid, &msg, sizeof(msg.mtext), 0, 0) == -1) {
+        perror("msgrcv failed");
+        exit(1);
+    }
+
+    // Print received message
+    printf("Received message: %s\n", msg.mtext);
+}
+
+int main()
+{
+  // Shared Memory Initialization and Key Generation
+  key_t key = ftok(".", 'S');
+  if (key == -1) {
+      perror("ftok failed");
+      return 1;
+  }
+
+  // Shared Memory Creation and Attachment
+  // Shared Memory ID
+  int shmid = shmget(key, sizeof(SharedMemory), IPC_CREAT | 0666);
+  if (shmid == -1) {
+      perror("shmget failed");
+      return 1;
+  }
+
+  // Attach Shared Memory
+  shared_memory = (SharedMemory *) shmat(shmid, NULL, 0);
+  if (shared_memory == (void *) -1) {
+      perror("shmat failed");
+      return 1;
+  }
+  pthread_attr_t attr; /* set of attributes for the thread */
+
+  pthread_attr_init(&attr);
+
+  int msgqid;
+
+  // Generate a key for the message queue
+  if ((key = ftok(".", 'B')) == -1) {
+      perror("ftok failed");
+      exit(1);
+  }
+
+  // Create or access the message queue
+  if ((msgqid = msgget(key, IPC_CREAT | 0666)) == -1) {
+      perror("msgget failed");
+      exit(1);
+  }
+  // Simulate task manager loop
+  while (1) {
+      // User input handling
+      printf("\nThread control options:\n");
+      printf("1. Create threads\n");
+      printf("2. Suspend thread\n");
+      printf("3. Resume thread\n");
+      printf("4. Terminate thread\n");
+      printf("5. Kill process\n");
+      printf("6. Display thread information\n");
+      printf("7. Display process information\n");
+      printf("8. Evaluate IPC performance\n");
+      printf("9. Send message\n");
+      printf("10. Receive message\n");
+      printf("11. Exit\n");
+      printf("Enter option: ");
+
+      int option;
+      scanf("%d", &option);
+
+      pthread_t thread_id;
+      int task_id, process_id;
+      switch (option) {
+          case 1: {
+              // User input handling for number of threads to create
+              int num_to_create;
+              printf("Enter the number of threads to create (up to %d): ", MAX_THREADS);
+              scanf("%d", &num_to_create);
+
+              if (num_to_create > MAX_THREADS || num_to_create < 1) {
+                  printf("Invalid number of threads.\n");
+                  break;
+              }
+
+              // Create threads
+              for (int i = 0; i < num_to_create; i++) {
+                  if (num_threads >= MAX_THREADS) {
+                      printf("Maximum number of threads reached!\n");
+                      break;
+                  }
+                  pthread_create(&threads[num_threads].tid, &attr, runner, (void *)&threads[num_threads]);
+                  threads[num_threads].task_id = num_threads;
+                  threads[num_threads].process_id = num_processes; // Assign current process ID
+                  threads[num_threads].status = 1; // Set thread status to running
+                  num_threads++;
+              }
+
+              // Create LWP
+              lwps[num_lwps].lwp_id = num_lwps; // Assign LWP ID
+              lwps[num_lwps].process_id = num_processes; // Assign current process ID
+              num_lwps++;
+
+              // Create Process
+              processes[num_processes].process_id = num_processes; // Assign process ID
+              num_processes++;
+              break;
+          }
+          case 2:
+              printf("Enter task ID to suspend: ");
+              scanf("%d", &task_id);
+              suspendThread(task_id);
+              break;
+          case 3:
+              printf("Enter task ID to resume: ");
+              scanf("%d", &task_id);
+              resumeThread(task_id);
+              break;
+          case 4:
+              printf("Enter task ID to terminate: ");
+              scanf("%d", &task_id);
+              for (int i = 0; i < num_threads; i++) {
+                  if (threads[i].task_id == task_id) {
+                      printf("Terminating thread ID %ld\n", threads[i].tid);
+                      pthread_cancel(threads[i].tid);
+                      // Remove the terminated thread from the array
+                      for (int j = i; j < num_threads - 1; j++) {
+                          threads[j] = threads[j + 1];
+                      }
+                      num_threads--;
+                      break;
+                  }
+              }
+              break;
+          case 5:
+              printf("Enter process ID to kill: ");
+              scanf("%d", &process_id);
+              for (int i = 0; i < num_threads; i++) {
+                  if (threads[i].process_id == process_id) {
+                      printf("Terminating thread ID %ld\n", threads[i].tid);
+                      pthread_cancel(threads[i].tid);
+                      // Remove the terminated thread from the array
+                      for (int j = i; j < num_threads - 1; j++) {
+                          threads[j] = threads[j + 1];
+                      }
+                      num_threads--;
+                  }
+              }
+              // Remove the killed process and associated LWPs from the arrays
+              for (int i = 0; i < num_processes; i++) {
+                  if (processes[i].process_id == process_id) {
+                      for (int j = i; j < num_processes - 1; j++) {
+                          processes[j] = processes[j + 1];
+                      }
+                      num_processes--;
+                  }
+              }
+              for (int i = 0; i < num_lwps; i++) {
+                  if (lwps[i].process_id == process_id) {
+                      for (int j = i; j < num_lwps - 1; j++) {
+                          lwps[j] = lwps[j + 1];
+                      }
+                      num_lwps--;
+                  }
+              }
+              break;
+          case 6:
+            // Display thread information
+            printf("Thread information:\n");
+            for (int i = 0; i < num_threads; i++) {
+                printf("Thread ID: %ld, Task ID: %d, Process ID: %d, LWP ID: %d, Status: %s\n",
+                       threads[i].tid, threads[i].task_id, threads[i].process_id, threads[i].lwp_id,
+                       threads[i].status == 1 ? "Running" : (threads[i].status == 0 ? "Suspended" : "Completed"));
+            }
+            break;
+          case 7:
+            // Display process information
+            printf("Process information:\n");
+            for (int i = 0; i < num_processes; i++) {
+                printf("Process ID: %d\n", processes[i].process_id);
+                printf("Associated Threads:\n");
+                for (int j = 0; j < num_threads; j++) {
+                    if (threads[j].process_id == processes[i].process_id) {
+                        printf("Thread ID: %ld, Task ID: %d, Status: %s\n", threads[j].tid, threads[j].task_id,
+                               threads[j].status == 1 ? "Running" : (threads[j].status == 0 ? "Suspended" : "Completed"));
+                    }
+                }
+                printf("Associated LWPs:\n");
+                for (int k = 0; k < num_lwps; k++) {
+                    if (lwps[k].process_id == processes[i].process_id) {
+                        printf("LWP ID: %d\n", lwps[k].lwp_id);
+                    }
+                }
+                printf("\n");
+            }
+            break;
+          case 8:
+            // Evaluate IPC performance
+            printf("Evaluating IPC performance...\n");
+
+            // Measure performance with short messages
+            clock_t start_short = clock();
+            for (int i = 0; i < NUM_MESSAGES; i++) {
+                shared_memory->data = i;
+            }
+            clock_t end_short = clock();
+            double time_short = ((double) (end_short - start_short)) / CLOCKS_PER_SEC;
+
+            // Measure performance with long messages
+            clock_t start_long = clock();
+            for (int i = 0; i < NUM_MESSAGES; i++) {
+                snprintf(shared_memory->message, sizeof(shared_memory->message), "This is a long message number %d", i);
+            }
+            clock_t end_long = clock();
+            double time_long = ((double) (end_long - start_long)) / CLOCKS_PER_SEC;
+
+            printf("Performance evaluation completed:\n");
+            printf("Time taken for %d short messages: %.6f seconds\n", NUM_MESSAGES, time_short);
+            printf("Time taken for %d long messages: %.6f seconds\n", NUM_MESSAGES, time_long);
+        case 9:
+            printf("Enter message to send: ");
+            char message[MESSAGE_SIZE_SHORT];
+            scanf("%s", message);
+            sendMessage(message);
+            break;
+        // New case for receiving message
+        case 10:
+            receiveMessage();
+            break;
+
+        case 11:
+            // Destroy the message queue and detach shared memory
+            msgctl(msgqid, IPC_RMID, NULL);
+            shmdt(shared_memory);
+            exit(0);
+          default:
+            printf("Invalid option!\n");
+        }
+
+        sleep(1); // Simulate periodic update
+    }
+
+    return 0;
+}
